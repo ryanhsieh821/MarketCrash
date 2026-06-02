@@ -71,6 +71,35 @@ header h1 {
   font-size: 13px;
 }
 .tab-btn:hover:not(.active), .reload-btn:hover { color: var(--text); border-color: var(--accent); }
+.notify-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.notify-controls input {
+  width: 48px;
+  padding: 4px 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+}
+.notify-controls button {
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 12px;
+}
+.notify-controls button:hover { color: var(--text); border-color: var(--accent); }
 #status-bar {
   display: flex;
   align-items: center;
@@ -174,6 +203,12 @@ footer a { color: var(--accent); text-decoration: none; }
     <button class="tab-btn active" id="btn-twse" onclick="switchMarket('twse')">上市</button>
     <button class="tab-btn" id="btn-otc" onclick="switchMarket('otc')">上櫃</button>
   </div>
+  <div class="notify-controls">
+    <span>通知門檻</span>
+    <input id="notify-threshold" type="number" min="0" max="100" step="1" value="60" onchange="saveNotifyThreshold()">
+    <button id="notify-btn" onclick="enableNotifications()">啟用</button>
+    <button onclick="testNotification()">測試</button>
+  </div>
   <button class="reload-btn" onclick="loadData()">重新載入</button>
 </header>
 
@@ -202,6 +237,86 @@ footer a { color: var(--accent); text-decoration: none; }
 
 <script>
 "use strict";
+
+const notifyState = {
+  enabled: localStorage.getItem("panicNotifyEnabled") === "1",
+  threshold: Number(localStorage.getItem("panicNotifyThreshold") || 60),
+  lastKey: localStorage.getItem("panicNotifyLastKey") || ""
+};
+
+function initNotificationControls() {
+  const input = document.getElementById("notify-threshold");
+  const btn = document.getElementById("notify-btn");
+  if (input) input.value = notifyState.threshold;
+  updateNotifyButton();
+}
+
+function updateNotifyButton() {
+  const btn = document.getElementById("notify-btn");
+  if (!btn) return;
+  if (!("Notification" in window)) {
+    btn.textContent = "不支援";
+    btn.disabled = true;
+    return;
+  }
+  if (Notification.permission === "granted" && notifyState.enabled) btn.textContent = "通知中";
+  else if (Notification.permission === "denied") btn.textContent = "已封鎖";
+  else btn.textContent = "啟用";
+}
+
+function saveNotifyThreshold() {
+  const input = document.getElementById("notify-threshold");
+  const value = Math.max(0, Math.min(100, Number(input?.value || 60)));
+  notifyState.threshold = value;
+  localStorage.setItem("panicNotifyThreshold", String(value));
+}
+
+async function enableNotifications() {
+  if (!("Notification" in window)) {
+    alert("此瀏覽器不支援通知。");
+    return;
+  }
+  const permission = Notification.permission === "granted"
+    ? "granted"
+    : await Notification.requestPermission();
+  notifyState.enabled = permission === "granted";
+  localStorage.setItem("panicNotifyEnabled", notifyState.enabled ? "1" : "0");
+  updateNotifyButton();
+}
+
+function sendNotification(title, body) {
+  if (!("Notification" in window) || Notification.permission !== "granted") return false;
+  try {
+    new Notification(title, { body, tag: "twse-panic-index", renotify: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function testNotification() {
+  saveNotifyThreshold();
+  if (!notifyState.enabled || Notification.permission !== "granted") {
+    enableNotifications().then(() => {
+      if (notifyState.enabled) sendNotification("台股恐慌指標測試", "通知功能已啟用。");
+    });
+    return;
+  }
+  sendNotification("台股恐慌指標測試", "通知功能正常。");
+}
+
+function maybeNotify(d) {
+  if (!notifyState.enabled || !("Notification" in window) || Notification.permission !== "granted") return;
+  if (!Number.isFinite(d.score) || d.score < notifyState.threshold) return;
+  const key = [d.market, d.date, Math.floor(d.score), d.label].join("|");
+  if (key === notifyState.lastKey) return;
+  notifyState.lastKey = key;
+  localStorage.setItem("panicNotifyLastKey", key);
+  sendNotification(
+    "台股恐慌指標達門檻",
+    `${d.index_name} ${d.score}/100（${d.label}），門檻 ${notifyState.threshold}。`
+  );
+}
 
 function nowTaipei() {
   const d = new Date();
@@ -866,8 +981,10 @@ function render(d) {
     '</table></div>' +
     (d.history.length >= 2 ? '<div class="card"><div class="card-title">近 ' + d.history.length + ' 筆走勢</div><div class="spark-wrap">' + sparkline(d.history) + '</div><div class="spark-dates"><span>' + escapeHtml(d.history[0]?.date || "") + "</span><span>" + escapeHtml(d.history[d.history.length - 1]?.date || "") + "</span></div>" + histChips + "</div>" : "") +
     "</div></div>";
+  maybeNotify(d);
 }
 
+initNotificationControls();
 loadData();
 </script>
 </body>
