@@ -230,8 +230,7 @@ footer a { color: var(--accent); text-decoration: none; }
   資料來源：
   <a href="https://www.twse.com.tw" target="_blank" rel="noreferrer">TWSE 臺灣證券交易所</a> 、
   <a href="https://www.tpex.org.tw" target="_blank" rel="noreferrer">TPEX 證券櫃檯買賣中心</a> 、
-  <a href="https://mis.twse.com.tw" target="_blank" rel="noreferrer">MIS 即時行情</a> 、
-  <a href="https://openapi.taifex.com.tw" target="_blank" rel="noreferrer">TAIFEX OpenAPI</a><br>
+  <a href="https://mis.twse.com.tw" target="_blank" rel="noreferrer">MIS 即時行情</a><br>
   純 HTML + JS 模式；若官方 API 被瀏覽器 CORS 擋住，會嘗試公開 CORS 轉接，失敗則顯示 --。
 </footer>
 
@@ -336,6 +335,10 @@ function rocTextToDateStr(text) {
   if (!parts) return /^\d{8}$/.test(raw) ? raw : "";
   return String(Number(parts[1]) + 1911) + parts[2].padStart(2, "0") + parts[3].padStart(2, "0");
 }
+function rocTextToDisplay(text) {
+  const date = rocTextToDateStr(text);
+  return date ? date.replace(/(\d{4})(\d{2})(\d{2})/, "$1/$2/$3") : "";
+}
 function parseNum(v) {
   const n = parseFloat(String(v ?? "").replace(/,/g, "").replace(/%/g, "").replace(/\+/g, "").trim());
   return Number.isFinite(n) ? n : 0;
@@ -374,7 +377,15 @@ function sortRows(rows) {
   }
   return [...seen.entries()].sort((a, b) => String(a[0]).localeCompare(String(b[0]))).map(([, row]) => row);
 }
-const sourceStats = { direct: 0, proxy: 0, fail: 0 };
+const sourceStats = { direct: 0, proxy: 0, cache: 0, fail: 0, optionalFail: 0, details: [] };
+function resetSourceStats() {
+  sourceStats.direct = 0;
+  sourceStats.proxy = 0;
+  sourceStats.cache = 0;
+  sourceStats.fail = 0;
+  sourceStats.optionalFail = 0;
+  sourceStats.details = [];
+}
 function proxyUrls(url) {
   return [
     { label: "直連", url },
@@ -384,9 +395,33 @@ function proxyUrls(url) {
     { label: "CodeTabs", url: "https://api.codetabs.com/v1/proxy/?quest=" + encodeURIComponent(url) }
   ];
 }
-async function apiFetch(url) {
+function shortHost(url) {
+  try { return new URL(url).hostname.replace(/^www\./, ""); }
+  catch { return url; }
+}
+function cacheKey(url) {
+  return "panicCache:" + url;
+}
+function saveApiCache(url, json) {
+  try {
+    localStorage.setItem(cacheKey(url), JSON.stringify({ t: Date.now(), json }));
+  } catch {}
+}
+function readApiCache(url, maxAgeHours = 72) {
+  try {
+    const raw = localStorage.getItem(cacheKey(url));
+    if (!raw) return null;
+    const box = JSON.parse(raw);
+    if (!box || !box.json || Date.now() - box.t > maxAgeHours * 3600000) return null;
+    return box;
+  } catch {
+    return null;
+  }
+}
+async function apiFetch(url, name = "", options = {}) {
   const urls = proxyUrls(url);
   let lastError = null;
+  const tried = [];
   for (const target of urls) {
     const ctl = new AbortController();
     const timer = setTimeout(() => ctl.abort(), 4500);
@@ -397,21 +432,55 @@ async function apiFetch(url) {
       const json = JSON.parse(text);
       if (target.label === "直連") sourceStats.direct++;
       else sourceStats.proxy++;
+      saveApiCache(url, json);
+      sourceStats.details.push({
+        name: name || shortHost(url),
+        host: shortHost(url),
+        status: "成功",
+        via: target.label,
+        tried: tried.concat(target.label).join(" → ")
+      });
       return json;
     } catch (e) {
       lastError = e;
+      tried.push(target.label + ":" + (e.name === "AbortError" ? "timeout" : e.message));
     } finally {
       clearTimeout(timer);
     }
   }
-  sourceStats.fail++;
+  if (options.recordFailure !== false) {
+    const cached = options.cache !== false ? readApiCache(url, options.cacheHours || 72) : null;
+    if (cached) {
+      sourceStats.cache++;
+      sourceStats.details.push({
+        name: name || shortHost(url),
+        host: shortHost(url),
+        status: "快取",
+        via: "localStorage",
+        tried: tried.join(" | ") + "；使用 " + new Date(cached.t).toLocaleString("zh-TW", { hour12: false }) + " 快取"
+      });
+      return cached.json;
+    }
+    if (options.optional) sourceStats.optionalFail++;
+    else sourceStats.fail++;
+    sourceStats.details.push({
+      name: name || shortHost(url),
+      host: shortHost(url),
+      status: options.optional ? "選用失敗" : "失敗",
+      via: "--",
+      tried: tried.join(" | ")
+    });
+  }
   throw lastError || new Error("fetch failed");
 }
-async function fetchFirstJson(urls) {
+async function fetchFirstJson(urls, name = "", options = {}) {
   let lastError = null;
-  for (const url of urls) {
+  for (let i = 0; i < urls.length; i++) {
     try {
-      return await apiFetch(url);
+      return await apiFetch(urls[i], name, {
+        ...options,
+        recordFailure: i === urls.length - 1
+      });
     } catch (e) {
       lastError = e;
     }
@@ -424,7 +493,7 @@ function rowsFromOpenApi(j) {
 
 async function fetchMIS(exCh) {
   try {
-    const j = await apiFetch("https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=" + exCh + "&json=1&delay=0&_=" + Date.now());
+    const j = await apiFetch("https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=" + exCh + "&json=1&delay=0&_=" + Date.now(), "即時行情", { optional: true });
     const d = j?.msgArray?.[0];
     if (!d) return {};
     return {
@@ -445,7 +514,7 @@ async function fetchFMTQIK(dateStr) {
     const j = await fetchFirstJson([
       "https://www.twse.com.tw/rwd/zh/afterTrading/FMTQIK?response=json&date=" + dateStr,
       "https://openapi.twse.com.tw/v1/exchangeReport/FMTQIK"
-    ]);
+    ], "大盤歷史/成交金額");
     const openRows = rowsFromOpenApi(j);
     if (openRows.length) {
       return sortRows(openRows.map(r => ({
@@ -473,7 +542,7 @@ async function fetchIndexOHLC(dateStr) {
     const j = await fetchFirstJson([
       "https://www.twse.com.tw/rwd/zh/indicesReport/MI_5MINS_HIST?response=json&date=" + dateStr,
       "https://openapi.twse.com.tw/v1/indicesReport/MI_5MINS_HIST"
-    ]);
+    ], "開高低/振幅");
     const openRows = rowsFromOpenApi(j);
     if (openRows.length) {
       const row = openRows.find(r => rocTextToDateStr(r["日期"] ?? r.Date) === dateStr || String(r["日期"] || r.Date || "").replace(/\//g, "") === dateStr) || openRows[openRows.length - 1];
@@ -501,7 +570,7 @@ async function fetchIndexOHLC(dateStr) {
 
 async function fetchBreadth(dateStr) {
   try {
-    const od = await apiFetch("https://openapi.twse.com.tw/v1/opendata/twtazu_od");
+    const od = await apiFetch("https://openapi.twse.com.tw/v1/opendata/twtazu_od", "漲跌家數/漲跌停", { recordFailure: false });
     const latest = rowsFromOpenApi(od).find(r => {
       const d = rocTextToDateStr(r["出表日期"] || r["日期"] || r.Date);
       return (!d || d === dateStr || d.slice(-4) === dateStr.slice(4)) && String(r["類型"] || "").includes("股票");
@@ -520,7 +589,7 @@ async function fetchBreadth(dateStr) {
     }
   } catch {}
   try {
-    const j = await apiFetch("https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX?response=json&date=" + dateStr + "&type=MS");
+    const j = await apiFetch("https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX?response=json&date=" + dateStr + "&type=MS", "漲跌家數備援");
     for (const tbl of j?.tables || []) {
       const fields = tbl.fields || [];
       const title = String(tbl.title || "");
@@ -557,7 +626,7 @@ async function fetchForeign(dateStr) {
     const j = await fetchFirstJson([
       "https://www.twse.com.tw/rwd/zh/fund/BFI82U?response=json&dayDate=" + dateStr + "&type=day",
       "https://www.twse.com.tw/rwd/zh/fund/BFI82U?response=json&type=day"
-    ]);
+    ], "三大法人");
     const fields = j?.fields || [];
     let foreign = 0, trust = 0, dealer = 0;
     for (const row of j?.data || []) {
@@ -576,13 +645,30 @@ async function fetchForeign(dateStr) {
 
 async function fetchMarginStats() {
   try {
-    const rows = await apiFetch("https://openapi.twse.com.tw/v1/exchangeReport/MI_MARGN");
+    const j = await fetchFirstJson([
+      "https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN?response=json",
+      "https://openapi.twse.com.tw/v1/exchangeReport/MI_MARGN"
+    ], "融資融券", { optional: true });
     let marginPrev = 0, marginToday = 0, shortPrev = 0, shortToday = 0;
-    for (const row of rowsFromOpenApi(rows)) {
-      marginPrev += parseNum(row["融資前日餘額"]);
-      marginToday += parseNum(row["融資今日餘額"]);
-      shortPrev += parseNum(row["融券前日餘額"]);
-      shortToday += parseNum(row["融券今日餘額"]);
+    if (Array.isArray(j?.tables)) {
+      const table = j.tables.find(t => String(t.title || "").includes("信用交易統計")) || j.tables[0];
+      for (const row of table?.data || []) {
+        if (String(row[0]).includes("融資(交易單位)")) {
+          marginPrev = parseNum(row[4]);
+          marginToday = parseNum(row[5]);
+        }
+        if (String(row[0]).includes("融券(交易單位)")) {
+          shortPrev = parseNum(row[4]);
+          shortToday = parseNum(row[5]);
+        }
+      }
+    } else {
+      for (const row of rowsFromOpenApi(j)) {
+        marginPrev += parseNum(row["融資前日餘額"]);
+        marginToday += parseNum(row["融資今日餘額"]);
+        shortPrev += parseNum(row["融券前日餘額"]);
+        shortToday += parseNum(row["融券今日餘額"]);
+      }
     }
     return {
       margin_prev: marginPrev || null,
@@ -604,28 +690,49 @@ async function fetchMarginStats() {
   }
 }
 
-async function fetchPutCallRatio() {
+async function fetchFinanceIndex() {
   try {
-    const rows = await apiFetch("https://openapi.taifex.com.tw/v1/PutCallRatio");
-    const latest = rowsFromOpenApi(rows)[0];
-    if (!latest) return { pc_date: "", pc_vol_ratio: null, pc_oi_ratio: null };
+    const j = await fetchFirstJson([
+      "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX?response=json&type=IND",
+      "https://openapi.twse.com.tw/v1/exchangeReport/MI_INDEX"
+    ], "金融保險類", { optional: true });
+    const rows = [];
+    if (Array.isArray(j?.tables)) {
+      for (const table of j.tables) {
+        const fields = table.fields || [];
+        for (const dataRow of table.data || []) {
+          rows.push({
+            "日期": j.date || "",
+            "指數": field(dataRow, fields, ["指數"], 0),
+            "收盤指數": field(dataRow, fields, ["收盤指數"], 1),
+            "漲跌點數": field(dataRow, fields, ["漲跌點數"], 3),
+            "漲跌百分比": field(dataRow, fields, ["漲跌百分比(%)", "漲跌百分比"], 4)
+          });
+        }
+      }
+    } else {
+      rows.push(...rowsFromOpenApi(j));
+    }
+    const row = rows.find(r => r["指數"] === "金融保險類指數");
+    const inverse = rows.find(r => r["指數"] === "臺指反向一倍指數");
+    if (!row && !inverse) return { finance_pct: null, finance_close: null, finance_date: "", inverse_pct: null, inverse_close: null };
     return {
-      pc_date: latest.Date || "",
-      pc_vol_ratio: parseNum(latest["PutCallVolumeRatio%"]),
-      pc_oi_ratio: parseNum(latest["PutCallOIRatio%"]),
-      put_volume: parseNum(latest.PutVolume),
-      call_volume: parseNum(latest.CallVolume),
-      put_oi: parseNum(latest.PutOI),
-      call_oi: parseNum(latest.CallOI)
+      finance_date: row?.["日期"] || inverse?.["日期"] || "",
+      finance_close: row ? parseNum(row["收盤指數"]) : null,
+      finance_chg_pts: row ? parseNum(row["漲跌點數"]) : null,
+      finance_pct: row ? parseNum(row["漲跌百分比"]) : null,
+      inverse_close: inverse ? parseNum(inverse["收盤指數"]) : null,
+      inverse_chg_pts: inverse ? parseNum(inverse["漲跌點數"]) : null,
+      inverse_pct: inverse ? parseNum(inverse["漲跌百分比"]) : null
     };
   } catch {
-    return { pc_date: "", pc_vol_ratio: null, pc_oi_ratio: null };
+    return { finance_pct: null, finance_close: null, finance_date: "", inverse_pct: null, inverse_close: null };
   }
 }
 
 async function fetchTPEX(rocDate) {
   try {
-    const j = await apiFetch("https://www.tpex.org.tw/www/zh-tw/afterTrading/dailyMk?response=json&date=" + encodeURIComponent(rocDate));
+    const j = await apiFetch("https://www.tpex.org.tw/www/zh-tw/afterTrading/dailyMk?response=json&date=" + encodeURIComponent(rocDate), "上櫃日資料");
     const table = j?.tables?.[0] || j || {};
     const fields = table.fields || j?.fields || [];
     const rows = table.data || j?.data || [];
@@ -657,18 +764,28 @@ function calcScore(m) {
   const breadthParts = [downS, limitDownS].filter(Number.isFinite);
   const breadthS = breadthParts.length ? breadthParts.reduce((s, v) => s + v, 0) / breadthParts.length : null;
   const foreignS = Number.isFinite(m.foreignNet) ? Math.min(Math.max(-m.foreignNet / 1e8, 0) / 200 * 100, 100) : null;
-  const putCallS = Number.isFinite(m.pcOiRatio) ? Math.min(Math.max((m.pcOiRatio - 130) / 100 * 100, 0), 100) : null;
+  const hedgeS = Number.isFinite(m.inversePct) ? Math.min(Math.max(m.inversePct, 0) / 3 * 100, 100) : null;
   const marginS = Number.isFinite(m.marginChgPct) ? Math.min(Math.max(-m.marginChgPct, 0) / 2 * 100, 100) : null;
   const shortS = Number.isFinite(m.shortChgPct) ? Math.min(Math.max(m.shortChgPct, 0) / 20 * 100, 100) : null;
+  let financeS = null;
+  if (Number.isFinite(m.financePct) && Number.isFinite(m.chgPct)) {
+    const relative = m.financePct - m.chgPct;
+    if (m.financePct < 0 && m.chgPct < 0) financeS = Math.min(Math.max(-m.financePct / 2 * 100, 0), 100);
+    else if (m.chgPct < 0 && relative > 1) financeS = 20;
+    else if (m.financePct > 1 && m.chgPct >= 0) financeS = 0;
+    else if (m.financePct < m.chgPct - 1) financeS = 45;
+    else financeS = 10;
+  }
   const parts = [
     [dropS, .22],
     [ampS, .12],
     [volS, .10],
-    [breadthS, .18],
+    [breadthS, .16],
     [foreignS, .12],
-    [putCallS, .12],
+    [hedgeS, .12],
     [marginS, .08],
-    [shortS, .06]
+    [shortS, .06],
+    [financeS, .04]
   ].filter(([value]) => Number.isFinite(value));
   const weight = parts.reduce((s, [, w]) => s + w, 0) || 1;
   const score = +(parts.reduce((s, [value, w]) => s + value * w, 0) / weight).toFixed(1);
@@ -685,9 +802,10 @@ function calcScore(m) {
       volume: Number.isFinite(volS) ? +volS.toFixed(1) : null,
       breadth: Number.isFinite(breadthS) ? +breadthS.toFixed(1) : null,
       foreign: Number.isFinite(foreignS) ? +foreignS.toFixed(1) : null,
-      putCall: Number.isFinite(putCallS) ? +putCallS.toFixed(1) : null,
+      hedge: Number.isFinite(hedgeS) ? +hedgeS.toFixed(1) : null,
       margin: Number.isFinite(marginS) ? +marginS.toFixed(1) : null,
-      short: Number.isFinite(shortS) ? +shortS.toFixed(1) : null
+      short: Number.isFinite(shortS) ? +shortS.toFixed(1) : null,
+      finance: Number.isFinite(financeS) ? +financeS.toFixed(1) : null
     };
   }
 }
@@ -728,11 +846,11 @@ async function collectTWSE() {
   const high = hasRT && rt.high ? rt.high : ohlc.high || 0;
   const low = hasRT && rt.low ? rt.low : ohlc.low || 0;
   const ampPct = high && low && prev_close ? +((high - low) / prev_close * 100).toFixed(2) : null;
-  const [breadthD, foreignD, marginD, pcD] = await Promise.all([
+  const [breadthD, foreignD, marginD, financeD] = await Promise.all([
     fetchBreadth(afterTradingDate),
     fetchForeign(afterTradingDate),
     fetchMarginStats(),
-    fetchPutCallRatio()
+    fetchFinanceIndex()
   ]);
   const hasBreadth = Number.isFinite(breadthD.up) && Number.isFinite(breadthD.down);
   const totalCnt = hasBreadth ? breadthD.up + breadthD.down : 0;
@@ -744,15 +862,16 @@ async function collectTWSE() {
     downRatio,
     limitDown: breadthD.limitDown,
     foreignNet: foreignD.foreign,
-    pcOiRatio: pcD.pc_oi_ratio,
+    inversePct: financeD.inverse_pct,
     marginChgPct: marginD.margin_chg_pct,
-    shortChgPct: marginD.short_chg_pct
+    shortChgPct: marginD.short_chg_pct,
+    financePct: financeD.finance_pct
   });
 
   return {
     market: "twse",
     index_name: "加權指數",
-    date: formatDisplayDate(now),
+    date: hasRT ? formatDisplayDate(now) : rocTextToDisplay(last.date) || formatDisplayDate(now),
     index_value,
     prev_close: +prev_close.toFixed(2),
     chg_pts: chgPts,
@@ -779,13 +898,14 @@ async function collectTWSE() {
     short_prev: marginD.short_prev,
     short_today: marginD.short_today,
     short_chg_pct: marginD.short_chg_pct,
-    pc_date: pcD.pc_date,
-    pc_vol_ratio: pcD.pc_vol_ratio,
-    pc_oi_ratio: pcD.pc_oi_ratio,
-    put_volume: pcD.put_volume,
-    call_volume: pcD.call_volume,
-    put_oi: pcD.put_oi,
-    call_oi: pcD.call_oi,
+    finance_date: financeD.finance_date,
+    finance_close: financeD.finance_close,
+    finance_chg_pts: financeD.finance_chg_pts,
+    finance_pct: financeD.finance_pct,
+    finance_relative_pct: Number.isFinite(financeD.finance_pct) ? +(financeD.finance_pct - chgPct).toFixed(2) : null,
+    inverse_close: financeD.inverse_close,
+    inverse_chg_pts: financeD.inverse_chg_pts,
+    inverse_pct: financeD.inverse_pct,
     history: rows.slice(-15).map(r => ({ date: r.date, close: r.close, chg_pts: r.chgPts })),
     fetched_at: new Date().toISOString(),
     realtime_time: hasRT ? rt.time : "",
@@ -854,6 +974,7 @@ function switchMarket(m) {
   loadData();
 }
 async function loadData() {
+  resetSourceStats();
   document.getElementById("st").textContent = "載入中...";
   document.getElementById("content").innerHTML =
     '<div class="grid"><div class="card" style="height:340px"><div class="skeleton" style="height:100%"></div></div><div><div class="card" style="height:160px"><div class="skeleton" style="height:100%"></div></div><div class="card" style="height:160px;margin-top:14px"><div class="skeleton" style="height:100%"></div></div></div></div>';
@@ -864,6 +985,35 @@ async function loadData() {
       '<div style="padding:80px;text-align:center;color:var(--red)"><div style="font-size:40px;margin-bottom:12px">錯誤</div><div>資料載入失敗：' + escapeHtml(e.message) + '</div><div style="font-size:12px;color:var(--muted);margin-top:8px">請稍後重試，或確認瀏覽器是否允許連線至交易所 API。</div></div>';
     document.getElementById("st").textContent = "載入失敗";
   }
+}
+
+function sourceDiagnosticsHtml() {
+  if (!sourceStats.details.length) return "尚無資料來源紀錄。";
+  return sourceStats.details.map(d => {
+    const color = d.status === "成功" || d.status === "快取" ? "var(--green)" : d.status === "選用失敗" ? "var(--yellow)" : "var(--red)";
+    return '<div style="padding:8px 0;border-bottom:1px solid var(--border)">' +
+      '<b style="color:' + color + '">' + escapeHtml(d.status) + '</b> ' +
+      escapeHtml(d.name) +
+      '<span style="color:var(--muted);margin-left:8px">' + escapeHtml(d.host) + '</span><br>' +
+      '<span style="font-size:11px;color:var(--muted)">路徑：' + escapeHtml(d.via) + '</span><br>' +
+      '<span style="font-size:11px;color:var(--muted);word-break:break-all">嘗試：' + escapeHtml(d.tried) + '</span>' +
+      '</div>';
+  }).join("");
+}
+
+function showSourceDiagnostics() {
+  const existing = document.getElementById("source-dialog");
+  if (existing) existing.remove();
+  const wrap = document.createElement("div");
+  wrap.id = "source-dialog";
+  wrap.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:99;display:flex;align-items:center;justify-content:center;padding:20px";
+  wrap.innerHTML =
+    '<div style="width:min(760px,100%);max-height:80vh;overflow:auto;background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:16px;color:var(--text)">' +
+    '<div style="display:flex;align-items:center;margin-bottom:10px"><b style="color:var(--accent);flex:1">資料來源診斷</b><button class="reload-btn" onclick="document.getElementById(&quot;source-dialog&quot;).remove()">關閉</button></div>' +
+    sourceDiagnosticsHtml() +
+    '</div>';
+  wrap.addEventListener("click", e => { if (e.target === wrap) wrap.remove(); });
+  document.body.appendChild(wrap);
 }
 
 function formatDisplayDate(d) {
@@ -939,11 +1089,12 @@ function render(d) {
   ["chg_pts", "chg_pct", "index_value", "prev_close", "amplitude_pct", "vol_ratio", "turnover", "turnover_avg5", "score", "level"].forEach(k => d[k] = Number(d[k] || 0));
   ["foreign_net", "trust_net", "dealer_net", "up", "down", "unchanged", "limit_up", "limit_down", "down_ratio",
    "margin_prev", "margin_today", "margin_chg_pct", "short_prev", "short_today", "short_chg_pct",
-   "pc_vol_ratio", "pc_oi_ratio", "put_volume", "call_volume", "put_oi", "call_oi"].forEach(k => {
+   "pc_vol_ratio", "pc_oi_ratio", "put_volume", "call_volume", "put_oi", "call_oi",
+   "finance_close", "finance_chg_pts", "finance_pct", "finance_relative_pct", "inverse_close", "inverse_chg_pts", "inverse_pct"].forEach(k => {
     d[k] = d[k] == null || !Number.isFinite(Number(d[k])) ? null : Number(d[k]);
   });
   d.sub = d.sub || {};
-  ["drop", "amplitude", "volume", "breadth", "foreign", "putCall", "margin", "short"].forEach(k => {
+  ["drop", "amplitude", "volume", "breadth", "foreign", "hedge", "margin", "short", "finance"].forEach(k => {
     d.sub[k] = d.sub[k] == null || !Number.isFinite(Number(d.sub[k])) ? null : Number(d.sub[k]);
   });
   d.history = Array.isArray(d.history) ? d.history : [];
@@ -951,7 +1102,7 @@ function render(d) {
   d.color = d.color || "var(--muted)";
   const fa = d.fetched_at ? new Date(d.fetched_at).toLocaleString("zh-TW", { timeZone: "Asia/Taipei", hour12: false, month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" }) : "--";
   document.getElementById("st").innerHTML = staleText(d.fetched_at) + '<span style="margin-left:12px">最後更新：' + fa + "</span>" + (d.realtime_time ? '<span style="color:var(--green);margin-left:10px">即時行情 ' + d.realtime_time + "</span>" : "");
-  document.getElementById("st").innerHTML += '<span style="margin-left:12px">直連 ' + sourceStats.direct + ' / Proxy ' + sourceStats.proxy + ' / 失敗 ' + sourceStats.fail + '</span>';
+  document.getElementById("st").innerHTML += '<span style="margin-left:12px">直連 ' + sourceStats.direct + ' / Proxy ' + sourceStats.proxy + ' / 快取 ' + sourceStats.cache + ' / 必要失敗 ' + sourceStats.fail + ' / 選用失敗 ' + sourceStats.optionalFail + '</span><button class="reload-btn" style="padding:3px 8px;margin-left:8px" onclick="showSourceDiagnostics()">查看來源</button>';
 
   if (d.index_value === 0) {
     document.getElementById("content").innerHTML = '<div style="padding:80px 40px;text-align:center;color:var(--muted)"><div style="font-size:48px;margin-bottom:14px">無資料</div><div style="font-size:15px">' + escapeHtml(d.warning || "目前沒有資料") + '</div></div>';
@@ -964,7 +1115,7 @@ function render(d) {
 
   document.getElementById("content").innerHTML =
     '<div class="grid"><div><div class="card" style="text-align:center"><div class="idx-name">' + escapeHtml(d.index_name) + " · " + escapeHtml(d.date || "") + '</div><div class="idx-value">' + fmt(d.index_value) + '</div><div class="idx-chg" style="color:' + cc(d.chg_pts) + '">' + sg(d.chg_pts) + fmt(d.chg_pts) + " (" + sg(d.chg_pct) + fmt(d.chg_pct) + '%)</div><div class="gauge-wrap">' + gauge(d.score, d.color) + '<div class="gauge-score"><div class="val" style="color:' + d.color + '">' + d.score + '</div><div class="sub">/ 100</div></div></div><div class="gauge-label" style="color:' + d.color + '">' + (marks[d.level] || "") + " " + escapeHtml(d.label) + "</div></div></div>" +
-    '<div><div class="card"><div class="card-title">恐慌分數組成</div>' + subBar("跌幅", 22, d.sub.drop) + subBar("振幅", 12, d.sub.amplitude) + subBar("量能", 10, d.sub.volume) + subBar("廣度/跌停", 18, d.sub.breadth) + subBar("外資賣超", 12, d.sub.foreign) + subBar("Put/Call", 12, d.sub.putCall) + subBar("融資退潮", 8, d.sub.margin) + subBar("融券空方", 6, d.sub.short) + "</div>" +
+    '<div><div class="card"><div class="card-title">恐慌分數組成</div>' + subBar("跌幅", 22, d.sub.drop) + subBar("振幅", 12, d.sub.amplitude) + subBar("量能", 10, d.sub.volume) + subBar("廣度/跌停", 16, d.sub.breadth) + subBar("外資賣超", 12, d.sub.foreign) + subBar("避險反向", 12, d.sub.hedge) + subBar("融資退潮", 8, d.sub.margin) + subBar("融券空方", 6, d.sub.short) + subBar("金融穩定", 4, d.sub.finance) + "</div>" +
     '<div class="card"><div class="card-title">市場資料</div><table>' +
     '<tr><td class="td-l">昨收</td><td class="td-v"><b>' + fmt(d.prev_close) + '</b></td><td class="td-l">開盤</td><td class="td-v"><b>' + (d.open ? fmt(d.open) : "--") + "</b></td></tr>" +
     '<tr><td class="td-l">最高 / 最低</td><td class="td-v" colspan="3"><b>' + (d.high ? fmt(d.high) : "--") + "</b> / <b>" + (d.low ? fmt(d.low) : "--") + '</b>' + (d.amplitude_pct ? ' <span style="color:var(--muted);font-size:11px">振幅 ' + fmt(d.amplitude_pct) + "%</span>" : "") + "</td></tr>" +
@@ -975,7 +1126,8 @@ function render(d) {
     '<tr><td class="td-l">外資</td><td class="td-v" style="color:' + cc(d.foreign_net) + '"><b>' + fmtBillion(d.foreign_net) + '</b></td><td class="td-l">投信</td><td class="td-v" style="color:' + cc(d.trust_net) + '"><b>' + fmtBillion(d.trust_net) + "</b></td></tr>" +
     '<tr><td class="td-l">自營商</td><td class="td-v" style="color:' + cc(d.dealer_net) + '" colspan="3"><b>' + fmtBillion(d.dealer_net) + "</b></td></tr></table></div>" +
     '<div class="card"><div class="card-title">崩盤輔助指標</div><table>' +
-    '<tr><td class="td-l">Put/Call OI</td><td class="td-v"><b>' + (d.pc_oi_ratio == null ? "--" : fmt(d.pc_oi_ratio, 2) + "%") + '</b></td><td class="td-l">Put/Call 量</td><td class="td-v"><b>' + (d.pc_vol_ratio == null ? "--" : fmt(d.pc_vol_ratio, 2) + "%") + "</b></td></tr>" +
+    '<tr><td class="td-l">臺指反向</td><td class="td-v" style="color:' + cc(d.inverse_pct) + '"><b>' + fmtPct(d.inverse_pct) + '</b></td><td class="td-l">反向指數</td><td class="td-v"><b>' + (d.inverse_close == null ? "--" : fmt(d.inverse_close)) + "</b></td></tr>" +
+    '<tr><td class="td-l">金融保險</td><td class="td-v" style="color:' + cc(d.finance_pct) + '"><b>' + fmtPct(d.finance_pct) + '</b></td><td class="td-l">相對大盤</td><td class="td-v" style="color:' + cc(d.finance_relative_pct) + '"><b>' + fmtPct(d.finance_relative_pct) + "</b></td></tr>" +
     '<tr><td class="td-l">融資餘額</td><td class="td-v"><b>' + fmtInt(d.margin_today) + '</b></td><td class="td-l">融資變化</td><td class="td-v" style="color:' + cc(d.margin_chg_pct) + '"><b>' + fmtPct(d.margin_chg_pct) + "</b></td></tr>" +
     '<tr><td class="td-l">融券餘額</td><td class="td-v"><b>' + fmtInt(d.short_today) + '</b></td><td class="td-l">融券變化</td><td class="td-v" style="color:' + cc(d.short_chg_pct) + '"><b>' + fmtPct(d.short_chg_pct) + "</b></td></tr>" +
     '</table></div>' +
